@@ -12,15 +12,14 @@
 #define STRINGIFY1(s) #s
 
 /*--------------------------- Libraries -------------------------------*/
-#include <ESP8266WiFi.h>
+#include <SPI.h>
+#include <MFRC522.h>
 #include <WiFiManager.h>
 #include <OXRS_MQTT.h>
 #include <OXRS_API.h>
 #include <MqttLogger.h>
 
-#include <SPI.h>
-#include <MFRC522.h>
-
+#include <ESP8266WiFi.h>
 
 /*--------------------------- Constants -------------------------------*/
 // Serial
@@ -29,10 +28,6 @@
 // REST API
 #define     REST_API_PORT             80
 
-// Hardware pins
-#define     SS_PIN                    D8
-#define     RST_PIN                   D3
- 
 /*--------------------------- Global Variables ------------------------*/
 // stack size counter
 char * stackStart;
@@ -53,7 +48,7 @@ OXRS_API _api(_mqtt);
 MqttLogger _logger(_mqttClient, "log", MqttLoggerMode::MqttAndSerial);
 
 // RFID reader
-MFRC522 mfrc522(SS_PIN, RST_PIN);
+MFRC522 mfrc522(SPI_CS_PIN, SPI_RST_PIN);
 
 /*--------------------------- Program ---------------------------------*/
 uint32_t getStackSize()
@@ -62,12 +57,12 @@ uint32_t getStackSize()
   return (uint32_t)stackStart - (uint32_t)&stack;  
 }
 
-char * toHexString(char buffer[], byte array[], unsigned int len)
+char * toHexString(char buffer[], byte data[], unsigned int len)
 {
   for (unsigned int i = 0; i < len; i++)
   {
-    byte nib1 = (array[i] >> 4) & 0x0F;
-    byte nib2 = (array[i] >> 0) & 0x0F;
+    byte nib1 = (data[i] >> 4) & 0x0F;
+    byte nib2 = (data[i] >> 0) & 0x0F;
 
     buffer[i*2+0] = nib1  < 0xA ? '0' + nib1  : 'A' + nib1  - 0xA;
     buffer[i*2+1] = nib2  < 0xA ? '0' + nib2  : 'A' + nib2  - 0xA;
@@ -85,7 +80,7 @@ unsigned int readData_MIFARE_UL(byte data[])
   byte buffer[18];
   byte byteCount = sizeof(buffer);
 
-  int data_idx = 0;
+  int dataCount = 0;
 
   // Each read is 4 pages of 4 bytes - we skip the first 4 pages as that is the UID
   for (byte page = 4; page <= 15; page += 4)
@@ -102,15 +97,15 @@ unsigned int readData_MIFARE_UL(byte data[])
     {
       for (int j = 0; j <= 3; j++)
       {
-        data[data_idx++] = buffer[4 * i + j];
+        data[dataCount++] = buffer[4 * i + j];
       }
     }
   }
 
-  return data_idx;
+  return dataCount;
 }
 
-void publishUid(MFRC522::Uid uid)
+void publishCard(MFRC522::Uid uid)
 {
   char buffer[128];
   byte data[64];
@@ -147,7 +142,7 @@ void processMFRC522()
     return;
 
   // Publish the details of the card
-  publishUid(mfrc522.uid);
+  publishCard(mfrc522.uid);
 
   // Halt reader
   mfrc522.PICC_HaltA();
@@ -210,9 +205,6 @@ void getConfigSchemaJson(JsonVariant json)
   configSchema["type"] = "object";
 
   JsonObject properties = configSchema.createNestedObject("properties");
-
-  JsonObject debug = properties.createNestedObject("debug");
-  debug["type"] = "boolean";
 }
 
 void getCommandSchemaJson(JsonVariant json)
@@ -225,9 +217,6 @@ void getCommandSchemaJson(JsonVariant json)
   commandSchema["type"] = "object";
 
   JsonObject properties = commandSchema.createNestedObject("properties");
-
-  JsonObject restart = properties.createNestedObject("restart");
-  restart["type"] = "boolean";
 }
 
 /**
@@ -305,19 +294,10 @@ void _mqttCallback(char * topic, byte * payload, int length)
 
 void _mqttConfig(JsonVariant json)
 {
-  bool update = false;
-  
-  if (json.containsKey("debug"))
-  {
-  }
 }
 
 void _mqttCommand(JsonVariant json)
 {
-  if (json.containsKey("restart") && json["restart"].as<bool>())
-  {
-    ESP.restart();
-  }
 }
 
 /**

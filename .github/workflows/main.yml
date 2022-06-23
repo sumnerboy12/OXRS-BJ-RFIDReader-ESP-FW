@@ -36,7 +36,7 @@ jobs:
         pip install --upgrade platformio
     
     - name: Build release binary
-      run: pio run -e d1_mini
+      run: pio run -e d1mini-wifi
 
     - name: Create release
       uses: ncipollo/release-action@v1
