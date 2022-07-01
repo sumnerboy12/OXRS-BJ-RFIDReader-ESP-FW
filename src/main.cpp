@@ -12,8 +12,11 @@
 #define STRINGIFY1(s) #s
 
 /*--------------------------- Libraries -------------------------------*/
-#include <SPI.h>
-#include <MFRC522.h>
+#include <NfcAdapter.h>
+#include <PN532/PN532/PN532.h>
+#include <PN532/PN532_HSU/PN532_HSU.h>
+
+#include <SoftwareSerial.h>
 #include <WiFiManager.h>
 #include <OXRS_MQTT.h>
 #include <OXRS_API.h>
@@ -45,10 +48,11 @@ WiFiServer _server(REST_API_PORT);
 OXRS_API _api(_mqtt);
 
 // Logging
-MqttLogger _logger(_mqttClient, "log", MqttLoggerMode::MqttAndSerial);
+MqttLogger _logger(_mqttClient, "log", MqttLoggerMode::MqttOnly);
 
 // RFID reader
-MFRC522 mfrc522(SPI_CS_PIN, SPI_RST_PIN);
+PN532_HSU pn532hsu(Serial);
+NfcAdapter nfc(pn532hsu);
 
 /*--------------------------- Program ---------------------------------*/
 uint32_t getStackSize()
@@ -57,95 +61,14 @@ uint32_t getStackSize()
   return (uint32_t)stackStart - (uint32_t)&stack;  
 }
 
-char * toHexString(char buffer[], byte data[], unsigned int len)
+void processPN532() 
 {
-  for (unsigned int i = 0; i < len; i++)
-  {
-    byte nib1 = (data[i] >> 4) & 0x0F;
-    byte nib2 = (data[i] >> 0) & 0x0F;
-
-    buffer[i*2+0] = nib1  < 0xA ? '0' + nib1  : 'A' + nib1  - 0xA;
-    buffer[i*2+1] = nib2  < 0xA ? '0' + nib2  : 'A' + nib2  - 0xA;
-  }
-
-  buffer[len*2] = '\0';
-  return buffer;
-}
-
-unsigned int readData_MIFARE_UL(byte data[])
-{
-  MFRC522::StatusCode status;
-
-  // 16 (data) + 2 (CRC)
-  byte buffer[18];
-  byte byteCount = sizeof(buffer);
-
-  int dataCount = 0;
-
-  // Each read is 4 pages of 4 bytes - we skip the first 4 pages as that is the UID
-  for (byte page = 4; page <= 15; page += 4)
-  {
-    status = mfrc522.MIFARE_Read(page, buffer, &byteCount);
-    if (status != mfrc522.STATUS_OK)
-    {
-      _logger.print(F("MIFARE_Read() failed: "));
-      _logger.println(mfrc522.GetStatusCodeName(status));
-      break;
+    _logger.println("\nScan a NFC tag\n");
+    if (nfc.tagPresent()) {
+        NfcTag tag = nfc.read();
+        tag.print();
     }
-
-    for (int i = 0; i <= 3; i++)
-    {
-      for (int j = 0; j <= 3; j++)
-      {
-        data[dataCount++] = buffer[4 * i + j];
-      }
-    }
-  }
-
-  return dataCount;
-}
-
-void publishCard(MFRC522::Uid uid)
-{
-  char buffer[128];
-  byte data[64];
-  unsigned int data_len = 0;
-
-  // Get the card type
-  MFRC522::PICC_Type type = mfrc522.PICC_GetType(uid.sak);
-
-  // Attempt to read any data from supported card types
-  if (type == MFRC522::PICC_TYPE_MIFARE_UL)
-  {
-    data_len = readData_MIFARE_UL(data);
-  }
-
-  // Build the JSON payload
-  StaticJsonDocument<256> json;
-
-  json["sak"] = uid.sak;
-  json["type"] = mfrc522.PICC_GetTypeName(type);
-  json["uid"] = toHexString(buffer, uid.uidByte, uid.size);
-  json["data"] = toHexString(buffer, data, data_len);
-
-  _mqtt.publishStatus(json.as<JsonVariant>());
-}
-
-void processMFRC522() 
-{
-  // Only interested in new card reads (i.e. don't loop if a card is held over the reader)
-  if (!mfrc522.PICC_IsNewCardPresent())
-    return;
-
-  // Verify the card has been read
-  if (!mfrc522.PICC_ReadCardSerial())
-    return;
-
-  // Publish the details of the card
-  publishCard(mfrc522.uid);
-
-  // Halt reader
-  mfrc522.PICC_HaltA();
+    delay(5000);
 }
 
 void getFirmwareJson(JsonVariant json)
@@ -378,13 +301,10 @@ void initialiseRestApi(void)
   _server.begin();
 }
 
-void initialiseMFRC522(void)
+void initialisePN532(void)
 {
-  // Start the SPI bus
-  SPI.begin();
-
-  // Initialise the MFRC522 card
-  mfrc522.PCD_Init();
+  // Initialise the PN532 reader
+  nfc.begin();
 }
 
 /**
@@ -410,8 +330,8 @@ void setup()
   // Set up the REST API
   initialiseRestApi();
 
-  // Set up the MFRC522 RFID reader
-  initialiseMFRC522();
+  // Set up the RFID reader
+  initialisePN532();
 }
 
 /**
@@ -427,5 +347,5 @@ void loop()
   _api.loop(&client);
 
   // Process RFID reader
-  processMFRC522();
+  processPN532();
 }
