@@ -12,11 +12,12 @@
 #define STRINGIFY1(s) #s
 
 /*--------------------------- Libraries -------------------------------*/
-#include <NfcAdapter.h>
+#include <Wire.h>
 #include <PN532/PN532/PN532.h>
-#include <PN532/PN532_HSU/PN532_HSU.h>
-
+#include <PN532/PN532_I2C/PN532_I2C.h>
+#include <NfcAdapter.h>
 #include <SoftwareSerial.h>
+
 #include <WiFiManager.h>
 #include <OXRS_MQTT.h>
 #include <OXRS_API.h>
@@ -26,10 +27,16 @@
 
 /*--------------------------- Constants -------------------------------*/
 // Serial
-#define     SERIAL_BAUD_RATE          115200
+#define     SERIAL_BAUD_RATE              115200
 
 // REST API
-#define     REST_API_PORT             80
+#define     REST_API_PORT                 80
+
+// Time between tag reads
+#define     DEFAULT_TAG_READ_INTERVAL_MS  200
+
+// Max NFC tag UID length
+#define     MAX_UID_BYTES                 8
 
 /*--------------------------- Global Variables ------------------------*/
 // stack size counter
@@ -51,8 +58,13 @@ OXRS_API _api(_mqtt);
 MqttLogger _logger(_mqttClient, "log", MqttLoggerMode::MqttOnly);
 
 // RFID reader
-PN532_HSU pn532hsu(Serial);
-NfcAdapter nfc(pn532hsu);
+PN532_I2C pn532_i2c(Wire);
+NfcAdapter nfc = NfcAdapter(pn532_i2c);
+
+// Last tag read and when
+uint32_t tagReadIntervalMs = DEFAULT_TAG_READ_INTERVAL_MS;
+uint32_t lastTagReadMs = 0L;
+byte lastUid[MAX_UID_BYTES];
 
 /*--------------------------- Program ---------------------------------*/
 uint32_t getStackSize()
@@ -61,14 +73,106 @@ uint32_t getStackSize()
   return (uint32_t)stackStart - (uint32_t)&stack;  
 }
 
+char * toHexString(char buffer[], byte data[], uint8_t len)
+{
+  for (uint8_t i = 0; i < len; i++)
+  {
+    byte nib1 = (data[i] >> 4) & 0x0F;
+    byte nib2 = (data[i] >> 0) & 0x0F;
+
+    buffer[i*2+0] = nib1  < 0xA ? '0' + nib1  : 'A' + nib1 - 0xA;
+    buffer[i*2+1] = nib2  < 0xA ? '0' + nib2  : 'A' + nib2 - 0xA;
+  }
+
+  buffer[len*2] = '\0';
+  return buffer;
+}
+
+char * toAsciiString(char buffer[], byte data[], uint8_t len)
+{
+  for (uint8_t i = 0; i < len; i++)
+  {
+    if (data[i] <= 0x1F) 
+    {
+      buffer[i] = '.';
+    } 
+    else 
+    {
+      buffer[i] = (char)data[i];
+    }
+  }
+
+  buffer[len] = '\0';
+  return buffer;
+}
+
+void publishTag(NfcTag * tag)
+{
+  // get the tag UID
+  byte uid[MAX_UID_BYTES];
+  tag->getUid(uid, tag->getUidLength());
+
+  // build the JSON payload with the tag details
+  DynamicJsonDocument json(4096);
+  char buffer[1024];
+
+  json["uid"] = toHexString(buffer, uid, tag->getUidLength());
+  json["type"] = tag->getTagType();
+
+  // does this tag have a message encoded?
+  if (tag->hasNdefMessage())
+  {
+    NdefMessage ndefMessage = tag->getNdefMessage();
+
+    JsonArray recordsJson = json.createNestedArray("records");
+    for (uint8_t i = 0; i < ndefMessage.getRecordCount(); i++)
+    {
+      NdefRecord ndefRecord = ndefMessage.getRecord(i);
+
+      int payloadLength = ndefRecord.getPayloadLength();
+      byte payload[payloadLength];
+      ndefRecord.getPayload(payload);
+
+      JsonObject recordJson = recordsJson.createNestedObject();
+      recordJson["tnf"] = ndefRecord.getTnf();
+      recordJson["type"] = ndefRecord.getType();
+      recordJson["id"] = ndefRecord.getId();
+      recordJson["bytes"] = ndefRecord.getEncodedSize();
+
+      JsonObject payloadJson = recordJson.createNestedObject("payload");
+      payloadJson["hex"] = toHexString(buffer, payload, payloadLength);
+      payloadJson["ascii"] = toAsciiString(buffer, payload, payloadLength);
+    }
+  }
+
+  _mqtt.publishStatus(json.as<JsonVariant>());
+}
+
 void processPN532() 
 {
-    _logger.println("\nScan a NFC tag\n");
-    if (nfc.tagPresent()) {
-        NfcTag tag = nfc.read();
-        tag.print();
-    }
-    delay(5000);
+  // if no tag present then ensure we are ready to read a new one
+  if (!nfc.tagPresent(5))
+  {
+    memset(lastUid, 0, MAX_UID_BYTES);
+    return;
+  }
+
+  // read the tag details
+  NfcTag tag = nfc.read();
+
+  // get the tag UID
+  byte uid[MAX_UID_BYTES];
+  tag.getUid(uid, tag.getUidLength());
+
+  // if the tag hasn't changed then nothing to do
+  if (memcmp(uid, lastUid, tag.getUidLength()) == 0) 
+    return;
+
+  // save the tag UID so we can ignore re-reads
+  memcpy(lastUid, uid, tag.getUidLength());
+
+  // publish the tag details
+  publishTag(&tag);
 }
 
 void getFirmwareJson(JsonVariant json)
@@ -128,6 +232,13 @@ void getConfigSchemaJson(JsonVariant json)
   configSchema["type"] = "object";
 
   JsonObject properties = configSchema.createNestedObject("properties");
+
+  JsonObject tagReadIntervalMs = properties.createNestedObject("tagReadIntervalMs");
+  tagReadIntervalMs["title"] = "Tag Read Interval (milliseconds)";
+  tagReadIntervalMs["description"] = "How often to check for a new tag near the reader (defaults to 200 milliseconds). Must be a number between 0 and 60000 (i.e. 1 min).";
+  tagReadIntervalMs["type"] = "integer";
+  tagReadIntervalMs["minimum"] = 0;
+  tagReadIntervalMs["maximum"] = 60000;
 }
 
 void getCommandSchemaJson(JsonVariant json)
@@ -217,6 +328,10 @@ void _mqttCallback(char * topic, byte * payload, int length)
 
 void _mqttConfig(JsonVariant json)
 {
+  if (json.containsKey("tagReadIntervalMs"))
+  {
+    tagReadIntervalMs = json["tagReadIntervalMs"].as<uint32_t>();
+  }
 }
 
 void _mqttCommand(JsonVariant json)
@@ -346,6 +461,13 @@ void loop()
   WiFiClient client = _server.available();
   _api.loop(&client);
 
-  // Process RFID reader
-  processPN532();
+  // Check if we are ready to read another tag
+  if ((millis() - lastTagReadMs) > tagReadIntervalMs)
+  {
+    // Process RFID reader
+    processPN532();
+
+    // Reset our timer
+    lastTagReadMs = millis();
+  }
 }
