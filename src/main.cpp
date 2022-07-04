@@ -12,11 +12,17 @@
 #define STRINGIFY1(s) #s
 
 /*--------------------------- Libraries -------------------------------*/
-#include <Wire.h>
-#include <PN532/PN532/PN532.h>
-#include <PN532/PN532_I2C/PN532_I2C.h>
-#include <NfcAdapter.h>
 #include <SoftwareSerial.h>
+#include <NfcAdapter.h>
+#include <PN532/PN532/PN532.h>
+
+#ifdef USE_I2C_NFC
+#include <Wire.h>
+#include <PN532/PN532_I2C/PN532_I2C.h>
+#else
+#include <SPI.h>
+#include <PN532/PN532_SPI/PN532_SPI.h>
+#endif
 
 #include <WiFiManager.h>
 #include <OXRS_MQTT.h>
@@ -55,11 +61,16 @@ WiFiServer _server(REST_API_PORT);
 OXRS_API _api(_mqtt);
 
 // Logging
-MqttLogger _logger(_mqttClient, "log", MqttLoggerMode::MqttOnly);
+MqttLogger _logger(_mqttClient, "log", MqttLoggerMode::MqttAndSerial);
 
 // RFID reader
+#ifdef USE_I2C_NFC
 PN532_I2C pn532_i2c(Wire);
 NfcAdapter nfc = NfcAdapter(pn532_i2c);
+#else
+PN532_SPI pn532_spi(SPI, SPI_SS_PIN);
+NfcAdapter nfc = NfcAdapter(pn532_spi);
+#endif
 
 // Last tag read and when
 uint32_t tagReadIntervalMs = DEFAULT_TAG_READ_INTERVAL_MS;
@@ -119,7 +130,7 @@ void publishTag(NfcTag * tag)
   json["uid"] = toHexString(buffer, uid, tag->getUidLength());
   json["type"] = tag->getTagType();
 
-  // does this tag have a message encoded?
+  // does this tag have a message?
   if (tag->hasNdefMessage())
   {
     NdefMessage ndefMessage = tag->getNdefMessage();
@@ -145,6 +156,7 @@ void publishTag(NfcTag * tag)
     }
   }
 
+  // publish the tag details to MQTT
   _mqtt.publishStatus(json.as<JsonVariant>());
 }
 
@@ -235,7 +247,7 @@ void getConfigSchemaJson(JsonVariant json)
 
   JsonObject tagReadIntervalMs = properties.createNestedObject("tagReadIntervalMs");
   tagReadIntervalMs["title"] = "Tag Read Interval (milliseconds)";
-  tagReadIntervalMs["description"] = "How often to check for a new tag near the reader (defaults to 200 milliseconds). Must be a number between 0 and 60000 (i.e. 1 min).";
+  tagReadIntervalMs["description"] = "How often to check if a tag is near the reader (defaults to 200 milliseconds). Must be a number between 0 and 60000 (i.e. 1 min).";
   tagReadIntervalMs["type"] = "integer";
   tagReadIntervalMs["minimum"] = 0;
   tagReadIntervalMs["maximum"] = 60000;
@@ -418,6 +430,16 @@ void initialiseRestApi(void)
 
 void initialisePN532(void)
 {
+  _logger.print("[rfid] scanning for NFC reader on ");
+
+#ifdef USE_I2C_NFC
+  _logger.println(F("I2C"));
+  Wire.begin();
+#else
+  _logger.println(F("SPI"));
+  SPI.begin();
+#endif
+
   // Initialise the PN532 reader
   nfc.begin();
 }
