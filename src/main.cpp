@@ -253,18 +253,6 @@ void getConfigSchemaJson(JsonVariant json)
   tagReadIntervalMs["maximum"] = 60000;
 }
 
-void getCommandSchemaJson(JsonVariant json)
-{
-  JsonObject commandSchema = json.createNestedObject("commandSchema");
-  
-  // Command schema metadata
-  commandSchema["$schema"] = JSON_SCHEMA_VERSION;
-  commandSchema["title"] = FW_SHORT_NAME;
-  commandSchema["type"] = "object";
-
-  JsonObject properties = commandSchema.createNestedObject("properties");
-}
-
 /**
   API callbacks
 */
@@ -275,7 +263,6 @@ void _apiAdopt(JsonVariant json)
   getSystemJson(json);
   getNetworkJson(json);
   getConfigSchemaJson(json);
-  getCommandSchemaJson(json);
 }
 
 /**
@@ -346,10 +333,6 @@ void _mqttConfig(JsonVariant json)
   }
 }
 
-void _mqttCommand(JsonVariant json)
-{
-}
-
 /**
   Initialisation
 */
@@ -407,7 +390,6 @@ void initialiseMqtt(byte * mac)
   _mqtt.onConnected(_mqttConnected);
   _mqtt.onDisconnected(_mqttDisconnected);
   _mqtt.onConfig(_mqttConfig);
-  _mqtt.onCommand(_mqttCommand);
   
   // Start listening for MQTT messages
   _mqttClient.setCallback(_mqttCallback);  
