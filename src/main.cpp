@@ -1,15 +1,11 @@
 /**
-  ESP8266 RFID reader firmware for the Open eXtensible Rack System
+  RFID reader firmware for the Open eXtensible Rack System
   
   GitHub repository:
     https://github.com/sumnerboy12/OXRS-BJ-RFIDReader-ESP-FW
     
   Copyright 2022 Ben Jones <ben.jones12@gmail.com>
 */
-
-/*--------------------------- Macros ----------------------------------*/
-#define STRINGIFY(s) STRINGIFY1(s)
-#define STRINGIFY1(s) #s
 
 /*--------------------------- Libraries -------------------------------*/
 #include <SoftwareSerial.h>
@@ -24,19 +20,19 @@
 #include <PN532/PN532_SPI/PN532_SPI.h>
 #endif
 
-#include <WiFiManager.h>
-#include <OXRS_MQTT.h>
-#include <OXRS_API.h>
-#include <MqttLogger.h>
+#if defined(OXRS_ESP32)
+#include <OXRS_32.h>                  // ESP32 support
+OXRS_32 oxrs;
 
-#include <ESP8266WiFi.h>
+#elif defined(OXRS_ESP8266)
+#include <OXRS_8266.h>                // ESP8266 support
+OXRS_8266 oxrs;
+
+#endif
 
 /*--------------------------- Constants -------------------------------*/
 // Serial
 #define     SERIAL_BAUD_RATE              115200
-
-// REST API
-#define     REST_API_PORT                 80
 
 // Time between tag reads
 #define     DEFAULT_TAG_READ_INTERVAL_MS  200
@@ -44,25 +40,7 @@
 // Max NFC tag UID length
 #define     MAX_UID_BYTES                 8
 
-/*--------------------------- Global Variables ------------------------*/
-// stack size counter
-char * stackStart;
-
 /*--------------------------- Instantiate Globals ---------------------*/
-// WiFi client
-WiFiClient _client;
-
-// MQTT client
-PubSubClient _mqttClient(_client);
-OXRS_MQTT _mqtt(_mqttClient);
-
-// REST API
-WiFiServer _server(REST_API_PORT);
-OXRS_API _api(_mqtt);
-
-// Logging
-MqttLogger _logger(_mqttClient, "log", MqttLoggerMode::MqttAndSerial);
-
 // RFID reader
 #ifdef USE_I2C_NFC
 PN532_I2C pn532_i2c(Wire);
@@ -78,12 +56,6 @@ uint32_t lastTagReadMs = 0L;
 byte lastUid[MAX_UID_BYTES];
 
 /*--------------------------- Program ---------------------------------*/
-uint32_t getStackSize()
-{
-  char stack;
-  return (uint32_t)stackStart - (uint32_t)&stack;  
-}
-
 char * toHexString(char buffer[], byte data[], uint8_t len)
 {
   for (uint8_t i = 0; i < len; i++)
@@ -156,8 +128,8 @@ void publishTag(NfcTag * tag)
     }
   }
 
-  // publish the tag details to MQTT
-  _mqtt.publishStatus(json.as<JsonVariant>());
+  // publish the tag details
+  oxrs.publishStatus(json.as<JsonVariant>());
 }
 
 void processPN532() 
@@ -187,145 +159,23 @@ void processPN532()
   publishTag(&tag);
 }
 
-void getFirmwareJson(JsonVariant json)
+void setConfigSchema()
 {
-  JsonObject firmware = json.createNestedObject("firmware");
-
-  firmware["name"] = FW_NAME;
-  firmware["shortName"] = FW_SHORT_NAME;
-  firmware["maker"] = FW_MAKER;
-  firmware["version"] = STRINGIFY(FW_VERSION);
-
-#if defined(FW_GITHUB_URL)
-  firmware["githubUrl"] = FW_GITHUB_URL;
-#endif
-}
-
-void getSystemJson(JsonVariant json)
-{
-  JsonObject system = json.createNestedObject("system");
-
-  system["heapUsedBytes"] = getStackSize();
-  system["heapFreeBytes"] = ESP.getFreeHeap();
-  system["flashChipSizeBytes"] = ESP.getFlashChipSize();
-
-  system["sketchSpaceUsedBytes"] = ESP.getSketchSize();
-  system["sketchSpaceTotalBytes"] = ESP.getFreeSketchSpace();
-
-  FSInfo fsInfo;
-  SPIFFS.info(fsInfo);
+  // Define our config schema
+  StaticJsonDocument<1024> json;
   
-  system["fileSystemUsedBytes"] = fsInfo.usedBytes;
-  system["fileSystemTotalBytes"] = fsInfo.totalBytes;
-}
-
-void getNetworkJson(JsonVariant json)
-{
-  byte mac[6];
-  WiFi.macAddress(mac);
-  
-  char mac_display[18];
-  sprintf_P(mac_display, PSTR("%02X:%02X:%02X:%02X:%02X:%02X"), mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-
-  JsonObject network = json.createNestedObject("network");
-
-  network["mode"] = "wifi";
-  network["ip"] = WiFi.localIP();
-  network["mac"] = mac_display;
-}
-
-void getConfigSchemaJson(JsonVariant json)
-{
-  JsonObject configSchema = json.createNestedObject("configSchema");
-  
-  // Config schema metadata
-  configSchema["$schema"] = JSON_SCHEMA_VERSION;
-  configSchema["title"] = FW_SHORT_NAME;
-  configSchema["type"] = "object";
-
-  JsonObject properties = configSchema.createNestedObject("properties");
-
-  JsonObject tagReadIntervalMs = properties.createNestedObject("tagReadIntervalMs");
+  JsonObject tagReadIntervalMs = json.createNestedObject("tagReadIntervalMs");
   tagReadIntervalMs["title"] = "Tag Read Interval (milliseconds)";
   tagReadIntervalMs["description"] = "How often to check if a tag is near the reader (defaults to 200 milliseconds). Must be a number between 0 and 60000 (i.e. 1 min).";
   tagReadIntervalMs["type"] = "integer";
   tagReadIntervalMs["minimum"] = 0;
   tagReadIntervalMs["maximum"] = 60000;
+
+  // Pass our config schema down to the hardware library
+  oxrs.setConfigSchema(json.as<JsonVariant>());
 }
 
-/**
-  API callbacks
-*/
-void _apiAdopt(JsonVariant json)
-{
-  // Build device adoption info
-  getFirmwareJson(json);
-  getSystemJson(json);
-  getNetworkJson(json);
-  getConfigSchemaJson(json);
-}
-
-/**
-  MQTT callbacks
-*/
-void _mqttConnected()
-{
-  // MqttLogger doesn't copy the logging topic to an internal
-  // buffer so we have to use a static array here
-  static char logTopic[64];
-  _logger.setTopic(_mqtt.getLogTopic(logTopic));
-
-  // Publish device adoption info
-  DynamicJsonDocument json(JSON_ADOPT_MAX_SIZE);
-  _mqtt.publishAdopt(_api.getAdopt(json.as<JsonVariant>()));
-
-  // Log the fact we are now connected
-  _logger.println("[rfid] mqtt connected");
-}
-
-void _mqttDisconnected(int state) 
-{
-  // Log the disconnect reason
-  // See https://github.com/knolleary/pubsubclient/blob/2d228f2f862a95846c65a8518c79f48dfc8f188c/src/PubSubClient.h#L44
-  switch (state)
-  {
-    case MQTT_CONNECTION_TIMEOUT:
-      _logger.println(F("[rfid] mqtt connection timeout"));
-      break;
-    case MQTT_CONNECTION_LOST:
-      _logger.println(F("[rfid] mqtt connection lost"));
-      break;
-    case MQTT_CONNECT_FAILED:
-      _logger.println(F("[rfid] mqtt connect failed"));
-      break;
-    case MQTT_DISCONNECTED:
-      _logger.println(F("[rfid] mqtt disconnected"));
-      break;
-    case MQTT_CONNECT_BAD_PROTOCOL:
-      _logger.println(F("[rfid] mqtt bad protocol"));
-      break;
-    case MQTT_CONNECT_BAD_CLIENT_ID:
-      _logger.println(F("[rfid] mqtt bad client id"));
-      break;
-    case MQTT_CONNECT_UNAVAILABLE:
-      _logger.println(F("[rfid] mqtt unavailable"));
-      break;
-    case MQTT_CONNECT_BAD_CREDENTIALS:
-      _logger.println(F("[rfid] mqtt bad credentials"));
-      break;      
-    case MQTT_CONNECT_UNAUTHORIZED:
-      _logger.println(F("[rfid] mqtt unauthorised"));
-      break;      
-  }
-}
-
-void _mqttCallback(char * topic, byte * payload, int length)
-{
-  // Pass down to our MQTT handler
-  _mqtt.receive(topic, payload, length);
-}
-
-void _mqttConfig(JsonVariant json)
+void jsonConfig(JsonVariant json)
 {
   if (json.containsKey("tagReadIntervalMs"))
   {
@@ -336,89 +186,15 @@ void _mqttConfig(JsonVariant json)
 /**
   Initialisation
 */
-void initialiseSerial()
-{
-  Serial.begin(SERIAL_BAUD_RATE);
-  delay(1000);
-  
-  _logger.println(F("[rfid] starting up..."));
-
-  DynamicJsonDocument json(128);
-  getFirmwareJson(json.as<JsonVariant>());
-
-  _logger.print(F("[rfid] "));
-  serializeJson(json, _logger);
-  _logger.println();
-}
-
-void initialseWifi(byte * mac)
-{
-  // Ensure we are in the correct WiFi mode
-  WiFi.mode(WIFI_STA);
-
-  // Connect using saved creds, or start captive portal if none found
-  // Blocks until connected or the portal is closed
-  WiFiManager wm;  
-  if (!wm.autoConnect("OXRS_WiFi", "superhouse"))
-  {
-    // If we are unable to connect then restart
-    ESP.restart();
-  }
-  
-  // Get ESP8266 base MAC address
-  WiFi.macAddress(mac);
-
-  // Format the MAC address for display
-  char mac_display[18];
-  sprintf_P(mac_display, PSTR("%02X:%02X:%02X:%02X:%02X:%02X"), mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-
-  // Display MAC/IP addresses on serial
-  _logger.print(F("[rfid] mac address: "));
-  _logger.println(mac_display);  
-  _logger.print(F("[rfid] ip address: "));
-  _logger.println(WiFi.localIP());
-}
-
-void initialiseMqtt(byte * mac)
-{
-  // Set the default client id to the last 3 bytes of the MAC address
-  char clientId[32];
-  sprintf_P(clientId, PSTR("%02x%02x%02x"), mac[3], mac[4], mac[5]);  
-  _mqtt.setClientId(clientId);
-  
-  // Register our callbacks
-  _mqtt.onConnected(_mqttConnected);
-  _mqtt.onDisconnected(_mqttDisconnected);
-  _mqtt.onConfig(_mqttConfig);
-  
-  // Start listening for MQTT messages
-  _mqttClient.setCallback(_mqttCallback);  
-}
-
-void initialiseRestApi(void)
-{
-  // NOTE: this must be called *after* initialising MQTT since that sets
-  //       the default client id, which has lower precendence than MQTT
-  //       settings stored in file and loaded by the API
-
-  // Set up the REST API
-  _api.begin();
-
-  // Register our callbacks
-  _api.onAdopt(_apiAdopt);
-
-  _server.begin();
-}
-
 void initialisePN532(void)
 {
-  _logger.print("[rfid] scanning for NFC reader on ");
+  oxrs.print("[rfid] scanning for NFC reader on ");
 
 #ifdef USE_I2C_NFC
-  _logger.println(F("I2C"));
+  oxrs.println(F("I2C"));
   Wire.begin();
 #else
-  _logger.println(F("SPI"));
+  oxrs.println(F("SPI"));
   SPI.begin();
 #endif
 
@@ -431,26 +207,18 @@ void initialisePN532(void)
 */
 void setup() 
 {
-  // Store the address of the stack at startup so we can determine
-  // the stack size at runtime (see getStackSize())
-  char stack;
-  stackStart = &stack;
+  Serial.begin(SERIAL_BAUD_RATE);
+  delay(1000);
+  Serial.println(F("[rfid] starting up..."));
   
-  // Set up serial
-  initialiseSerial();  
-
-  // Set up network and obtain an IP address
-  byte mac[6];
-  initialseWifi(mac);
-
-  // initialise MQTT
-  initialiseMqtt(mac);
-
-  // Set up the REST API
-  initialiseRestApi();
+  // Start hardware
+  oxrs.begin(jsonConfig, NULL);
 
   // Set up the RFID reader
   initialisePN532();
+
+  // Set up the config schema (for self-discovery and adoption)
+  setConfigSchema();
 }
 
 /**
@@ -458,12 +226,8 @@ void setup()
 */
 void loop() 
 {
-  // Check our MQTT broker connection is still ok
-  _mqtt.loop();
-
-  // Handle any REST API requests
-  WiFiClient client = _server.available();
-  _api.loop(&client);
+  // Let hardware handle any events etc
+  oxrs.loop();
 
   // Check if we are ready to read another tag
   if ((millis() - lastTagReadMs) > tagReadIntervalMs)
